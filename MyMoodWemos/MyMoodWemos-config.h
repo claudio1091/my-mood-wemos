@@ -7,20 +7,29 @@
 #define CONFIG_PIN_GREEN 14  // For RGB(W)
 #define CONFIG_PIN_BLUE  12  // For RGB(W)
 
-// DHT
-// Define the DHT type in the code file.
-#define CONFIG_DHT_PIN 16
-#define DHT_TYPE DHT11 // Update this to match your DHT type
+// LM35 Temperature Sensor
+#define CONFIG_PIN_LM35 0
 
 // WiFi
-#define CONFIG_WIFI_SSID "{WIFI-SSID}"
-#define CONFIG_WIFI_PASS "{WIFI-PASSWORD}"
+#define CONFIG_WIFI_SSID "VASCONCELOS"
+#define CONFIG_WIFI_PASS "vasC@84#"
 
 #define FIREBASE_HOST "https://my-mood-a16e2.firebaseio.com/"
 #define FIREBASE_AUTH "XI16Hf2dp7Mxpr6j5CCXhziczX9AixXSkT9z2n3y"
 
-// Publique a cada 5 min
-#define PUBLISH_INTERVAL 1000*60*5
+// MQTT
+#define CONFIG_MQTT_HOST "broker.hivemq.com"
+#define CONFIG_MQTT_PORT 1883 // Usually 1883
+#define CONFIG_MQTT_CLIENT_ID "WEMOS-" // Must be unique on the MQTT network
+
+// MQTT Topics
+#define CONFIG_MQTT_TOPIC_STATE "my-mood/lights"
+#define CONFIG_MQTT_TOPIC_SET "my-mood/lights/set"
+#define CONFIG_MQTT_TOPIC_TEMP "my-mood/temperature"
+
+// Publique a cada 30 min
+#define PUBLISH_DATA_FIREBASE 1000*60*30
+#define PUBLISH_DATA_MQTT 1000*60*1
 // Get a cada 30 segundos
 #define GET_INTERVAL 1000*30
 
@@ -36,4 +45,4 @@
 #define CONFIG_BUILTIN_LED_MODE 1
 
 // Enables Serial and print statements
-#define CONFIG_DEBUG false
+#define CONFIG_DEBUG true

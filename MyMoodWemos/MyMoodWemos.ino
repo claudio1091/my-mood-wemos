@@ -11,15 +11,19 @@
 */
 
 // Set configuration options for LED type, pins, WiFi, and MQTT in the following file:
-#include "config-my-mood.h"
+#include "MyMoodWemos-config.h"
 
 #include <ESP8266WiFi.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
 #include <FirebaseArduino.h>
 
-#include <Adafruit_Sensor.h>
-#include <DHT.h>
-#include <DHT_U.h>
-#include <Ticker.h>
+// https://github.com/bblanchon/ArduinoJson
+#include <ArduinoJson.h>
+// http://pubsubclient.knolleary.net/
+#include <PubSubClient.h>
 
 // Maintained state for reporting to HA
 byte red = 255;
@@ -48,29 +52,35 @@ bool colorfade = false;
 int currentColor = 0;
 // {red, grn, blu, wht}
 const byte colors[][4] = {
-  {255, 255, 255, -1},
-  {255, 0, 0, -1},
-  {0, 255, 0, -1},
-  {0, 0, 255, -1},
-  {255, 80, 0, -1},
-  {163, 0, 255, -1},
-  {0, 255, 255, -1},
-  {255, 255, 0, -1}
-};
+    {255, 255, 255, -1},
+    {255, 0, 0, -1},
+    {0, 255, 0, -1},
+    {0, 0, 255, -1},
+    {255, 80, 0, -1},
+    {163, 0, 255, -1},
+    {0, 255, 255, -1},
+    {255, 255, 0, -1}};
 const int numColors = 8;
 
-DHT_Unified dht(CONFIG_DHT_PIN, DHT_TYPE);
-unsigned long lastSampleTime = 0;
+//To make Arduino software autodetect OTA device
+WiFiServer TelnetServer(8266);
 
-Ticker ticker;
-bool publishNewState = true;
-bool lightState = true;
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-void setup() {
-  if (CONFIG_DEBUG) {
+unsigned long lastTimePublishFirebase = 0;
+unsigned long lastTimePublishMqtt = 0;
+
+void setup()
+{
+  if (CONFIG_DEBUG)
+  {
     Serial.begin(115200);
   }
 
+  //To make Arduino software autodetect OTA device
+  TelnetServer.begin();
+  
   pinMode(CONFIG_PIN_RED, OUTPUT);
   pinMode(CONFIG_PIN_GREEN, OUTPUT);
   pinMode(CONFIG_PIN_BLUE, OUTPUT);
@@ -79,32 +89,49 @@ void setup() {
 
   setup_wifi();
 
-  // Set up the DHT sensor
-  dht.begin();
+  // Arduino OTA
+  ArduinoOTA.setHostname("my-mood-device");
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA End");
+    Serial.println("Rebooting...");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r\n", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR)
+      Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+
+  client.setServer(CONFIG_MQTT_HOST, CONFIG_MQTT_PORT);
+  client.setCallback(callback);
 
   Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
 
   pinMode(BUILTIN_LED, OUTPUT);
-  digitalWrite(BUILTIN_LED, LOW); // Built in LED ON
-
-  // Registra o ticker para publicar de tempos em tempos
-  ticker.attach_ms(PUBLISH_INTERVAL, publish);
-  ticker.attach_ms(GET_INTERVAL, getLightState);
+  digitalWrite(BUILTIN_LED, HIGH);
 }
 
-void publish() {
-  publishNewState = true;
-}
-
-void getLightState() {
-  lightState = true;
-}
-
-void setup_wifi() {
+void setup_wifi()
+{
   delay(10);
   // We start by connecting to a WiFi network
 
-  if (CONFIG_DEBUG) {
+  if (CONFIG_DEBUG)
+  {
     Serial.println();
     Serial.print("Connecting to ");
     Serial.println(CONFIG_WIFI_SSID);
@@ -113,12 +140,14 @@ void setup_wifi() {
   WiFi.mode(WIFI_STA); // Disable the built-in WiFi access point.
   WiFi.begin(CONFIG_WIFI_SSID, CONFIG_WIFI_PASS);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED)
+  {
     delay(500);
     Serial.print(".");
   }
 
-  if (CONFIG_DEBUG) {
+  if (CONFIG_DEBUG)
+  {
     Serial.println("");
     Serial.println("WiFi connected");
     Serial.print("IP address: ");
@@ -128,24 +157,181 @@ void setup_wifi() {
   blinkBuiltInLed(2);
 }
 
-void processLightFirebase(FirebaseObject lightParam) {
-  stateOn = lightParam.getBool("/state");
-  
-  red = lightParam.getInt("/color/r");
-  green = lightParam.getInt("/color/g");
-  blue = lightParam.getInt("/color/b");
-  brightness = lightParam.getInt("/brightness");
-  transitionTime = lightParam.getInt("/transition");
-  colorfade = lightParam.getBool("/colorFade");
-  
+void callback(char *topic, byte *payload, unsigned int length)
+{
+  if (CONFIG_DEBUG)
+  {
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.println("] ");
+  }
+
+  char message[length + 1];
+  for (int i = 0; i < length; i++)
+  {
+    message[i] = (char)payload[i];
+  }
+  message[length] = '\0';
+
+  if (CONFIG_DEBUG)
+  {
+    Serial.println(message);
+  }
+
+  if (!processJson(message))
+  {
+    return;
+  }
+
+  if (stateOn)
+  {
+    // Update lights
+    realRed = map(red, 0, 255, 0, brightness);
+    realGreen = map(green, 0, 255, 0, brightness);
+    realBlue = map(blue, 0, 255, 0, brightness);
+  }
+  else
+  {
+    realRed = 0;
+    realGreen = 0;
+    realBlue = 0;
+  }
+
   startFade = true;
   inFade = false; // Kill the current fade
+
+  sendState();
 }
 
-void setColor(int inR, int inG, int inB) {
+bool processJson(char *message)
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+
+  JsonObject &root = jsonBuffer.parseObject(message);
+
+  if (!root.success())
+  {
+    Serial.println("parseObject() failed");
+    return false;
+  }
+
+  if (root.containsKey("state"))
+  {
+    if (strcmp(root["state"], "true") == 0)
+    {
+      stateOn = true;
+    }
+    else
+    {
+      stateOn = false;
+    }
+  }
+
+  if (strcmp(root["colorFade"], "true") == 0)
+  {
+
+    flash = false;
+    colorfade = true;
+    currentColor = 0;
+
+    if (root.containsKey("transition"))
+    {
+      transitionTime = root["transition"];
+    }
+    else
+    {
+      transitionTime = 30;
+    }
+  }
+  else if (colorfade && !root.containsKey("color") && root.containsKey("brightness"))
+  {
+    // Adjust brightness during colorfade
+    // (will be applied when fading to the next color)
+    brightness = root["brightness"];
+  }
+  else
+  { //  ==== NO EFFECT ====
+    flash = false;
+    colorfade = false;
+
+    if (rgb && root.containsKey("color"))
+    {
+      red = root["color"]["r"];
+      green = root["color"]["g"];
+      blue = root["color"]["b"];
+    }
+
+    if (root.containsKey("brightness"))
+    {
+      brightness = root["brightness"];
+    }
+
+    if (root.containsKey("transition"))
+    {
+      transitionTime = root["transition"];
+    }
+    else
+    {
+      transitionTime = 30;
+    }
+  }
+
+  return true;
+}
+
+void reconnect()
+{
+  // Loop until we're reconnected
+  while (!client.connected())
+  {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    // if (client.connect(CONFIG_MQTT_CLIENT_ID, CONFIG_MQTT_USER, CONFIG_MQTT_PASS)) {
+    if (client.connect(CONFIG_MQTT_CLIENT_ID + ESP.getChipId()))
+    {
+      Serial.println("connected");
+      client.subscribe(CONFIG_MQTT_TOPIC_SET);
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void sendState()
+{
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+
+  JsonObject &root = jsonBuffer.createObject();
+
+  root["state"] = stateOn;
+
+  JsonObject &color = root.createNestedObject("color");
+  color["r"] = red;
+  color["g"] = green;
+  color["b"] = blue;
+
+  root["brightness"] = brightness;
+  root["colorFade"] = colorfade;
+
+  char buffer[root.measureLength() + 1];
+  root.printTo(buffer, sizeof(buffer));
+
+  client.publish(CONFIG_MQTT_TOPIC_STATE, buffer, true);
+  blinkBuiltInLed(5);
+}
+
+void setColor(int inR, int inG, int inB)
+{
   blinkBuiltInLed(3);
 
-  if (CONFIG_INVERT_LED_LOGIC) {
+  if (CONFIG_INVERT_LED_LOGIC)
+  {
     inR = (255 - inR);
     inG = (255 - inG);
     inB = (255 - inB);
@@ -155,7 +341,8 @@ void setColor(int inR, int inG, int inB) {
   analogWrite(CONFIG_PIN_GREEN, inG);
   analogWrite(CONFIG_PIN_BLUE, inB);
 
-  if (CONFIG_DEBUG) {
+  if (CONFIG_DEBUG)
+  {
     Serial.print("Setting LEDs: {");
 
     Serial.print("r: ");
@@ -169,31 +356,77 @@ void setColor(int inR, int inG, int inB) {
   }
 }
 
-void loop() {
-  // Apenas publique quando passar o tempo determinado
-  if (publishNewState) {
-    Serial.println("Publish new State");
+void loop()
+{
+  unsigned long currentMillis = millis();
 
-    // Obtem os dados do sensor DHT 
-    float humidity = dht.readHumidity();
-    float temperature = dht.readTemperature();
+  if (!client.connected())
+  {
+    reconnect();
+  }
 
-    if (!isnan(humidity) && !isnan(temperature)) {
+  ArduinoOTA.handle();
+  client.loop();
+
+  // Publique Firebase
+  if (lastTimePublishFirebase == 0 || (currentMillis - lastTimePublishFirebase > PUBLISH_DATA_FIREBASE))
+  {
+    lastTimePublishFirebase = currentMillis;
+    DynamicJsonBuffer jsonBuffer;
+
+    float analogTemperature = analogRead(CONFIG_PIN_LM35);
+    float temperature = (analogTemperature * 0.00488);
+    temperature = temperature * 100;
+
+    if (!isnan(temperature))
+    {
+      // Push to Firebase
+      JsonObject &temperatureObject = jsonBuffer.createObject();
+      JsonObject &tempTime = temperatureObject.createNestedObject("timestamp");
+      temperatureObject["temperature"] = temperature;
+      tempTime[".sv"] = "timestamp";
+
       // Manda para o firebase
-      Firebase.pushFloat("temperature", temperature);
-      Firebase.pushFloat("humidity", humidity);    
-      publishNewState = false;
-    } else {
-      Serial.println("Error Publishing");
+      Firebase.push("/temperature", temperatureObject);
+
+      if (Firebase.failed())
+      {
+        Serial.print("pushing /temperature failed:");
+        Serial.println(Firebase.error());
+      }
+    }
+    else
+    {
+      Serial.println("Error Reading");
     }
   }
 
-  if (lightState) {
-    FirebaseObject lightParam = Firebase.get("/rgbstrip");
-    processLightFirebase(lightParam);
+  // Publique MQTT
+  currentMillis = millis();
+  if (lastTimePublishMqtt == 0 || (currentMillis - lastTimePublishMqtt > PUBLISH_DATA_MQTT))
+  {
+    float analogTemperature = analogRead(CONFIG_PIN_LM35);
+    float temperature = (analogTemperature * 0.00488);
+    temperature = temperature * 100;
+
+    if (!isnan(temperature))
+    {
+      // Push to Firebase
+      JsonObject &temperatureObject = jsonBuffer.createObject();
+      JsonObject &tempTime = temperatureObject.createNestedObject("timestamp");
+      temperatureObject["temperature"] = temperature;
+      tempTime[".sv"] = "timestamp";
+
+      client.publish(CONFIG_MQTT_TOPIC_TEMP, temperatureObject);
+    }
+    else
+    {
+      Serial.println("Error Reading");
+    }
   }
 
-  if (colorfade && !inFade) {
+  if (colorfade && !inFade)
+  {
     realRed = map(colors[currentColor][0], 0, 255, 0, brightness);
     realGreen = map(colors[currentColor][1], 0, 255, 0, brightness);
     realBlue = map(colors[currentColor][2], 0, 255, 0, brightness);
@@ -201,9 +434,11 @@ void loop() {
     startFade = true;
   }
 
-  if (startFade) {
+  if (startFade)
+  {
     // If we don't want to fade, skip it.
-    if (transitionTime == 0) {
+    if (transitionTime == 0)
+    {
       setColor(realRed, realGreen, realBlue);
 
       redVal = realRed;
@@ -211,7 +446,9 @@ void loop() {
       bluVal = realBlue;
 
       startFade = false;
-    } else {
+    }
+    else
+    {
       loopCount = 0;
       stepR = calculateStep(redVal, realRed);
       stepG = calculateStep(grnVal, realGreen);
@@ -221,11 +458,14 @@ void loop() {
     }
   }
 
-  if (inFade) {
+  if (inFade)
+  {
     startFade = false;
     unsigned long now = millis();
-    if (now - lastLoop > transitionTime) {
-      if (loopCount <= 1020) {
+    if (now - lastLoop > transitionTime)
+    {
+      if (loopCount <= 1020)
+      {
         lastLoop = now;
 
         redVal = calculateVal(stepR, redVal, loopCount);
@@ -234,13 +474,10 @@ void loop() {
 
         setColor(redVal, grnVal, bluVal); // Write current values to LED pins
 
-        if (CONFIG_DEBUG) {
-          Serial.print("Loop count: ");
-          Serial.println(loopCount);
-        }
-
         loopCount++;
-      } else {
+      }
+      else
+      {
         inFade = false;
       }
     }
@@ -276,10 +513,12 @@ void loop() {
   and then divides that gap by 1020 to determine the size of the step
   between adjustments in the value.
 */
-int calculateStep(int prevValue, int endValue) {
+int calculateStep(int prevValue, int endValue)
+{
   int step = endValue - prevValue; // What's the overall gap?
-  if (step) {                      // If its non-zero,
-    step = 1020 / step;          //   divide by 1020
+  if (step)
+  {                     // If its non-zero,
+    step = 1020 / step; //   divide by 1020
   }
 
   return step;
@@ -290,31 +529,39 @@ int calculateStep(int prevValue, int endValue) {
    colors, it increases or decreases the value of that color by 1.
    (R, G, and B are each calculated separately.)
 */
-int calculateVal(int step, int val, int i) {
-  if ((step) && i % step == 0) { // If step is non-zero and its time to change a value,
-    if (step > 0) {              //   increment the value if step is positive...
+int calculateVal(int step, int val, int i)
+{
+  if ((step) && i % step == 0)
+  { // If step is non-zero and its time to change a value,
+    if (step > 0)
+    { //   increment the value if step is positive...
       val += 1;
     }
-    else if (step < 0) {         //   ...or decrement it if step is negative
+    else if (step < 0)
+    { //   ...or decrement it if step is negative
       val -= 1;
     }
   }
 
   // Defensive driving: make sure val stays in the range 0-255
-  if (val > 255) {
+  if (val > 255)
+  {
     val = 255;
   }
-  else if (val < 0) {
+  else if (val < 0)
+  {
     val = 0;
   }
 
   return val;
 }
 
-void blinkBuiltInLed(int blinks) {
+void blinkBuiltInLed(int blinks)
+{
   int blinksAlready = 0;
 
-  while (blinksAlready < (blinks * 2)) {
+  while (blinksAlready < (blinks * 2))
+  {
     digitalWrite(BUILTIN_LED, !digitalRead(BUILTIN_LED)); // Built in LED ON
     blinksAlready++;
   }
